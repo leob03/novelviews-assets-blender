@@ -156,8 +156,9 @@ class NovelViewsProperties(PropertyGroup):
         name="Pass",
         description="Which render pass to output",
         items=[
-            ('DEPTH',  "Depth",          "Normalized grayscale depth (16-bit PNG)"),
-            ('NORMAL', "Surface Normal",  "Camera-space normals remapped 0–1 (RGB PNG)"),
+            ('DEPTH',    "Depth",          "Depth normalized to object bounds (16-bit PNG)"),
+            ('NORMAL',   "Surface Normal",  "Camera-space normals remapped 0–1 (RGB PNG)"),
+            ('POSITION', "Position",        "World-space position map remapped 0–1 (RGB PNG)"),
         ],
         default='DEPTH',
     )
@@ -616,8 +617,9 @@ class NOVELVIEWS_OT_setup_render_passes(Operator):
 
         # Enable required view-layer passes (always enable alpha for masking)
         vl = context.view_layer
-        vl.use_pass_z      = (props.render_pass_type == 'DEPTH')
-        vl.use_pass_normal = (props.render_pass_type == 'NORMAL')
+        vl.use_pass_z        = (props.render_pass_type == 'DEPTH')
+        vl.use_pass_normal   = (props.render_pass_type == 'NORMAL')
+        vl.use_pass_position = (props.render_pass_type == 'POSITION')
         if props.depth_mask_bg:
             scene.render.film_transparent = True  # guarantees alpha is available
 
@@ -633,8 +635,19 @@ class NOVELVIEWS_OT_setup_render_passes(Operator):
 
         if props.render_pass_type == 'DEPTH':
             self._setup_depth(scene, tree, rl, out_root, props)
-        else:
+        elif props.render_pass_type == 'NORMAL':
             self._setup_normal(scene, tree, rl, out_root, props)
+        else:
+            self._setup_position(scene, tree, rl, out_root, props)
+
+        # Output color management: Override → Display P3 / Raw
+        # This is what makes depth/normal output match Hunyuan3D's value range.
+        try:
+            scene.render.image_settings.color_management = 'OVERRIDE'
+            scene.render.image_settings.display_settings.display_device = 'Display P3'
+            scene.render.image_settings.view_settings.view_transform = 'Raw'
+        except Exception as e:
+            self.report({"WARNING"}, f"Could not set color management override: {e}")
 
         self.report({"INFO"}, f"Compositor ready — output: {out_root}")
         return {"FINISHED"}
@@ -662,24 +675,55 @@ class NOVELVIEWS_OT_setup_render_passes(Operator):
             return node, 0   # first file slot
 
     def _mask_node(self, tree, x):
-        """MixRGB set to MULTIPLY so alpha zeroes out background pixels."""
+        """MULTIPLY by alpha → background becomes black (0). Used for depth."""
         m = tree.nodes.new("CompositorNodeMixRGB")
         m.blend_type = 'MULTIPLY'
-        m.inputs[0].default_value = 1.0   # factor = 1
+        m.inputs[0].default_value = 1.0
+        m.location = (x, 0)
+        return m
+
+    def _white_bg_mask_node(self, tree, x):
+        """MIX with alpha as factor, white as color1 → background becomes white.
+        Usage: link alpha → inputs[0], computed → inputs[2]; white is inputs[1]."""
+        m = tree.nodes.new("CompositorNodeMixRGB")
+        m.blend_type = 'MIX'
+        m.inputs[1].default_value = (1.0, 1.0, 1.0, 1.0)  # white background
         m.location = (x, 0)
         return m
 
     def _setup_depth(self, scene, tree, rl, out_root, props):
         x = 260
 
-        # 1. Normalize raw Z to 0-1
-        norm = tree.nodes.new("CompositorNodeNormalize")
-        norm.location = (x, 0)
-        tree.links.new(rl.outputs["Depth"], norm.inputs[0])
-        prev = norm.outputs[0]
+        # Per-frame normalization within the masked region only.
+        # Double-normalize trick — equivalent to Hunyuan3D's masked min-max:
+        #
+        #   Pass 1:  Z × alpha  →  Normalize  →  Invert  →  × alpha
+        #     • masking before normalize excludes background from the range
+        #     • invert + re-mask brings background back to 0 (it became 1 after invert)
+        #   Pass 2:  Normalize
+        #     • stretches the remaining foreground range to [0, 1]
+        #     • result: near = white (1), far = black (0), background = black (0)
+
+        # Normalize raw Z to 0-1 using object bounds derived from camera & mesh settings.
+        # near/far computed from camera_distance ± mesh_radius so that only the
+        # foreground object spans the full [0,1] range — background gets clamped to 1.
+        mesh_radius = props.mesh_scale_factor / 2.0
+        near = props.camera_distance - mesh_radius
+        far  = props.camera_distance + mesh_radius
+
+        mv = tree.nodes.new("CompositorNodeMapValue")
+        mv.offset[0] = -near
+        mv.size[0]   = 1.0 / (far - near)
+        mv.use_min   = True
+        mv.use_max   = True
+        mv.min[0]    = 0.0
+        mv.max[0]    = 1.0
+        mv.location  = (x, 0)
+        tree.links.new(rl.outputs["Depth"], mv.inputs[0])
+        prev = mv.outputs[0]
         x += 220
 
-        # 2. Invert: 1 - depth  (near=1=white, far=0=black)
+        # Invert: 1 - depth  (near=white, far=black)
         if props.depth_invert:
             inv = tree.nodes.new("CompositorNodeMath")
             inv.operation = 'SUBTRACT'
@@ -689,15 +733,17 @@ class NOVELVIEWS_OT_setup_render_passes(Operator):
             prev = inv.outputs[0]
             x += 220
 
-        # 3. Mask background with alpha (multiply by alpha channel)
+        # Mask background to 0
         if props.depth_mask_bg:
-            mask = self._mask_node(tree, x)
-            tree.links.new(prev,                  mask.inputs[1])  # value → color slot
-            tree.links.new(rl.outputs["Alpha"],   mask.inputs[2])  # alpha as second color
+            mask = tree.nodes.new("CompositorNodeMath")
+            mask.operation = 'MULTIPLY'
+            mask.location = (x, 0)
+            tree.links.new(prev,                mask.inputs[0])
+            tree.links.new(rl.outputs["Alpha"], mask.inputs[1])
             prev = mask.outputs[0]
             x += 220
 
-        # 4. Output
+        # Output
         out, slot = self._output_node(scene, tree, out_root, "depth", props)
         out.location = (x, 0)
         if props.render_output_format == 'IMAGE_SEQ':
@@ -727,16 +773,58 @@ class NOVELVIEWS_OT_setup_render_passes(Operator):
         prev = add.outputs[0]
         x += 220
 
-        # 2. Mask background with alpha
+        # 2. White background: mix computed normals with white using alpha as factor
         if props.depth_mask_bg:
-            mask = self._mask_node(tree, x)
-            tree.links.new(prev,                  mask.inputs[1])
-            tree.links.new(rl.outputs["Alpha"],   mask.inputs[2])
+            mask = self._white_bg_mask_node(tree, x)
+            tree.links.new(rl.outputs["Alpha"], mask.inputs[0])  # factor
+            tree.links.new(prev,               mask.inputs[2])  # foreground
             prev = mask.outputs[0]
             x += 220
 
         # 3. Output
         out, slot = self._output_node(scene, tree, out_root, "normal", props)
+        out.location = (x, 0)
+        if props.render_output_format == 'IMAGE_SEQ':
+            out.format.file_format = 'PNG'
+            out.format.color_mode  = 'RGB'
+            out.format.color_depth = '8'
+        tree.links.new(prev, out.inputs[slot])
+
+    def _setup_position(self, scene, tree, rl, out_root, props):
+        x = 260
+
+        # Remap world-space positions to 0-1.
+        # Mesh is normalized to radius = scale_factor/2, so positions lie in
+        # [-scale_factor/2, scale_factor/2] per axis.
+        # Formula: pos / scale_factor + 0.5  →  maps [-0.575, 0.575] → [0, 1]
+        inv_s = 1.0 / props.mesh_scale_factor
+
+        mul = tree.nodes.new("CompositorNodeMixRGB")
+        mul.blend_type = 'MULTIPLY'
+        mul.inputs[0].default_value = 1.0
+        mul.inputs[2].default_value = (inv_s, inv_s, inv_s, 1.0)
+        mul.location = (x, 0)
+        tree.links.new(rl.outputs["Position"], mul.inputs[1])
+        x += 220
+
+        add = tree.nodes.new("CompositorNodeMixRGB")
+        add.blend_type = 'ADD'
+        add.inputs[0].default_value = 1.0
+        add.inputs[2].default_value = (0.5, 0.5, 0.5, 1.0)
+        add.location = (x, 0)
+        tree.links.new(mul.outputs[0], add.inputs[1])
+        prev = add.outputs[0]
+        x += 220
+
+        # White background: mix computed positions with white using alpha as factor
+        mask = self._white_bg_mask_node(tree, x)
+        tree.links.new(rl.outputs["Alpha"], mask.inputs[0])  # factor
+        tree.links.new(prev,               mask.inputs[2])   # foreground
+        prev = mask.outputs[0]
+        x += 220
+
+        # Output
+        out, slot = self._output_node(scene, tree, out_root, "position", props)
         out.location = (x, 0)
         if props.render_output_format == 'IMAGE_SEQ':
             out.format.file_format = 'PNG'
@@ -880,7 +968,8 @@ class NOVELVIEWS_PT_main_panel(Panel):
             col.separator()
             if props.render_pass_type == 'DEPTH':
                 col.prop(props, "depth_invert")
-            col.prop(props, "depth_mask_bg")
+            if props.render_pass_type != 'POSITION':
+                col.prop(props, "depth_mask_bg")
             col.separator()
             col.label(text="Output Format:")
             col.row().prop(props, "render_output_format", expand=True)
