@@ -1,22 +1,19 @@
 """
-Seamless single-camera trajectory through Hy3D multiview positions, with NO roll flips.
-
-Core ideas:
-- Camera position: SLERP between unit direction vectors -> fixed radius exactly.
-- Camera orientation: build a continuous local frame using parallel transport of the "up" vector.
-  This eliminates 90° roll jumps at waypoint boundaries and near poles.
+Seamless single-camera trajectory through Hy3D multiview viewpoints
+with pauses added ON TOP of a fixed 5s travel (120 frames @ 24fps).
 
 Trajectory:
 front -> front_left -> left -> back -> right -> front_right -> front -> top -> back -> bottom
 
+- Travel duration is fixed (TRAVEL_SECONDS).
+- Pauses increase total duration.
+- Fixed radius (exact).
+- Parallel-transported up (no 90° roll flips).
+- Baked per frame, linear interpolation.
+
 Usage:
 - Paste in Blender Scripting, Run.
-- Scrub timeline. You should see completely seamless motion.
-
-Notes:
-- Assumes mesh centered at origin.
-- Uses same Hy3D spherical camera convention + Hy3D->Blender camera position conversion
-  as your validated multiview setup.
+- Scrub timeline.
 """
 
 import bpy
@@ -28,15 +25,15 @@ from mathutils import Vector, Matrix, Quaternion
 # =========================
 CAMERA_DISTANCE = 1.45
 ORTHO_SCALE = 1.2
-DURATION_SECONDS = 5.0
+
+TRAVEL_SECONDS = 5.0     # movement time only (e.g. 5s -> 120 frames @ 24fps)
+PAUSE_SECONDS = 0.2     # pause at EACH waypoint, added on top of travel time
 
 START_AT_CURRENT_FRAME = False
-
-# Bake density: keep at 1 for maximum smoothness & stability
-KEY_EVERY_N_FRAMES = 1
+KEY_EVERY_N_FRAMES = 1   # keep 1 for maximum smoothness
 
 # =========================
-# Hy3D view definitions (matching your tested mapping)
+# Hy3D view definitions (matching your validated mapping)
 # =========================
 VIEW_TO_AZIM_ELEV = {
     "top":         (0,    0),
@@ -94,7 +91,6 @@ def clamp(x, a, b):
     return max(a, min(b, x))
 
 def slerp(u: Vector, v: Vector, t: float) -> Vector:
-    """Spherical linear interpolation between unit vectors u and v."""
     dot = clamp(u.dot(v), -1.0, 1.0)
     omega = math.acos(dot)
     if omega < 1e-9:
@@ -105,50 +101,27 @@ def slerp(u: Vector, v: Vector, t: float) -> Vector:
     return (a * u + b * v).normalized()
 
 def rotation_from_forward_up(forward: Vector, up: Vector) -> Quaternion:
-    """
-    Build a camera rotation such that:
-      - Camera local -Z points along 'forward' (towards origin).
-      - Camera local +Y aligns with 'up' as much as possible.
-    Returns quaternion rotation.
-    """
     f = forward.normalized()
     u = up.normalized()
 
-    # Orthonormalize (Gram-Schmidt)
-    # right = f x u  (we want right to be perpendicular)
     r = f.cross(u)
     if r.length < 1e-8:
-        # Degenerate: up parallel to forward. Caller should avoid, but be safe.
-        # Pick an arbitrary axis not parallel to forward:
         alt = Vector((1, 0, 0)) if abs(f.dot(Vector((1, 0, 0)))) < 0.9 else Vector((0, 1, 0))
         r = f.cross(alt)
     r.normalize()
     u = r.cross(f).normalized()
 
-    # Camera basis in world:
-    # local +X = right, local +Y = up, local +Z = backward
-    # because camera looks along local -Z, so local +Z points opposite forward
     backward = (-f).normalized()
-
-    # Columns are basis vectors for X,Y,Z in world space
     m = Matrix((r, u, backward)).transposed()
     return m.to_quaternion()
 
 def parallel_transport_up(prev_forward: Vector, forward: Vector, prev_up: Vector) -> Vector:
-    """
-    Parallel transport of 'up' along changing forward direction:
-    - Project prev_up onto plane perpendicular to new forward, renormalize.
-    This produces a smooth, minimal-twist frame (no roll flips).
-    """
     f = forward.normalized()
-    u = prev_up - f * prev_up.dot(f)  # remove component along forward
+    u = prev_up - f * prev_up.dot(f)
     if u.length < 1e-8:
-        # If we hit degeneracy (rare), reconstruct using prev_forward to keep continuity:
-        # Use the previous right vector if possible.
         pf = prev_forward.normalized()
         prev_right = pf.cross(prev_up)
         if prev_right.length < 1e-8:
-            # absolute fallback
             prev_right = Vector((1, 0, 0))
         u = prev_right.cross(f)
     return u.normalized()
@@ -187,70 +160,77 @@ def create_target_empty(col, name="Hy3D_PathTarget"):
     return target
 
 # =========================
-# Animation baking
+# Animation baking with pauses added on top
 # =========================
-def bake_camera_motion(cam_obj, trajectory_names, duration_seconds):
+def bake_camera_motion_with_pauses(cam_obj, trajectory_names, travel_seconds, pause_seconds):
     scene = bpy.context.scene
     fps = scene.render.fps if scene.render.fps > 0 else 24
 
-    total_frames = max(2, int(round(duration_seconds * fps)))
+    n_waypoints = len(trajectory_names)
+    n_segments = n_waypoints - 1
+
+    travel_frames_total = max(1, int(round(travel_seconds * fps)))
+    pause_frames = int(round(pause_seconds * fps))
+    total_pause_frames = pause_frames * n_waypoints  # pause at each waypoint
+
     start_frame = scene.frame_current if START_AT_CURRENT_FRAME else 1
 
-    # Compute waypoint unit directions
+    # Waypoint unit directions
     waypoint_positions = [blender_pos_for_view(v) for v in trajectory_names]
     waypoint_dirs = [p.normalized() for p in waypoint_positions]
 
-    # Segment angles for timing
+    # Segment angles for natural time allocation across travel frames
     angles = []
-    for i in range(len(waypoint_dirs) - 1):
+    for i in range(n_segments):
         dot = clamp(waypoint_dirs[i].dot(waypoint_dirs[i+1]), -1.0, 1.0)
         angles.append(math.acos(dot))
-
     total_angle = sum(angles) if sum(angles) > 1e-9 else 1.0
 
+    # Allocate travel frames per segment proportional to angle
     seg_frames = []
-    remaining = total_frames
+    remaining = travel_frames_total
     for i, ang in enumerate(angles):
         if i == len(angles) - 1:
             n = remaining
         else:
-            n = max(1, int(round(total_frames * (ang / total_angle))))
+            n = max(1, int(round(travel_frames_total * (ang / total_angle))))
             remaining -= n
         seg_frames.append(n)
 
-    # Clear existing animation
+    # Clear animation
     cam_obj.animation_data_clear()
+    cam_obj.rotation_mode = 'QUATERNION'
+
+    def key_pose(frame_idx, pos_vec, qrot):
+        cam_obj.location = pos_vec
+        cam_obj.rotation_quaternion = qrot
+        cam_obj.keyframe_insert(data_path="location", frame=frame_idx)
+        cam_obj.keyframe_insert(data_path="rotation_quaternion", frame=frame_idx)
 
     # Initialize at first waypoint
     frame = start_frame
     pos = waypoint_dirs[0] * CAMERA_DISTANCE
-
-    # forward points towards origin
     forward = (-pos).normalized()
 
-    # Choose a stable initial up reference:
-    # Use world Z as "up" unless too close to forward, then fall back to world Y.
+    # Stable initial up ref
     world_up_z = Vector((0, 0, 1))
     world_up_y = Vector((0, 1, 0))
-    init_up = world_up_z
-    if abs(forward.dot(init_up)) > 0.95:
-        init_up = world_up_y
+    init_up = world_up_z if abs(forward.dot(world_up_z)) <= 0.95 else world_up_y
     up = (init_up - forward * init_up.dot(forward)).normalized()
 
     q = rotation_from_forward_up(forward, up)
-
-    cam_obj.location = pos
-    cam_obj.rotation_mode = 'QUATERNION'
-    cam_obj.rotation_quaternion = q
-
-    cam_obj.keyframe_insert(data_path="location", frame=frame)
-    cam_obj.keyframe_insert(data_path="rotation_quaternion", frame=frame)
+    key_pose(frame, pos, q)
 
     prev_forward = forward.copy()
     prev_up = up.copy()
 
-    # Bake each segment
-    for i in range(len(waypoint_dirs) - 1):
+    # Pause at first waypoint
+    for _ in range(pause_frames):
+        frame += 1
+        key_pose(frame, pos, q)
+
+    # Travel each segment + pause at waypoint
+    for i in range(n_segments):
         u = waypoint_dirs[i]
         v = waypoint_dirs[i + 1]
         nframes = seg_frames[i]
@@ -265,38 +245,39 @@ def bake_camera_motion(cam_obj, trajectory_names, duration_seconds):
 
             forward = (-pos).normalized()
             up = parallel_transport_up(prev_forward, forward, prev_up)
-
             q = rotation_from_forward_up(forward, up)
 
             frame += 1
-            cam_obj.location = pos
-            cam_obj.rotation_quaternion = q
-
-            cam_obj.keyframe_insert(data_path="location", frame=frame)
-            cam_obj.keyframe_insert(data_path="rotation_quaternion", frame=frame)
+            key_pose(frame, pos, q)
 
             prev_forward = forward
             prev_up = up
 
-    # Timeline bounds
+        # Pause at the reached waypoint
+        for _ in range(pause_frames):
+            frame += 1
+            key_pose(frame, pos, q)
+
+    # Set timeline bounds
     scene.frame_start = start_frame
     scene.frame_end = frame
 
-    # Make interpolation perfectly smooth and non-overshooting:
-    # - Linear location prevents spherical overshoot artifacts.
-    # - Linear quaternion keys avoids spline weirdness in rotation.
+    # Linear interpolation everywhere (no overshoot)
     if cam_obj.animation_data and cam_obj.animation_data.action:
         for fcu in cam_obj.animation_data.action.fcurves:
             for kp in fcu.keyframe_points:
                 kp.interpolation = 'LINEAR'
 
-    # Optional: transparent background like your multiview
     scene.render.film_transparent = True
 
+    total_seconds = (scene.frame_end - scene.frame_start) / fps
+
     print("=" * 70)
-    print("DONE: Seamless Hy3D path camera baked (no roll flips).")
-    print(f"FPS: {fps}, Duration: {duration_seconds:.2f}s (~{total_frames} frames)")
-    print(f"Frames: {start_frame} -> {frame}")
+    print("DONE: Seamless Hy3D path camera baked WITH pauses added on top.")
+    print(f"FPS: {fps}")
+    print(f"Travel: {travel_seconds:.2f}s  (~{travel_frames_total} frames)")
+    print(f"Pause per waypoint: {pause_seconds:.3f}s (~{pause_frames} frames) x {n_waypoints} = {total_pause_frames} frames")
+    print(f"Total length: {total_seconds:.2f}s  (frames {scene.frame_start} -> {scene.frame_end})")
     print("Trajectory:", " -> ".join(trajectory_names))
     print("=" * 70)
 
@@ -304,13 +285,11 @@ def bake_camera_motion(cam_obj, trajectory_names, duration_seconds):
 # RUN
 # =========================
 def main():
-    col = ensure_collection("Hunyuan3D_PathCamera_Seamless")
+    col = ensure_collection("Hunyuan3D_PathCamera_Seamless_PausesPlus")
     cam = create_camera(col, "Hy3D_PathCam")
+    create_target_empty(col, "Hy3D_PathTarget")  # optional visual cue
 
-    # Optional target at origin (not used for constraints, but nice to see)
-    create_target_empty(col, "Hy3D_PathTarget")
-
-    bake_camera_motion(cam, TRAJECTORY, DURATION_SECONDS)
+    bake_camera_motion_with_pauses(cam, TRAJECTORY, TRAVEL_SECONDS, PAUSE_SECONDS)
 
 if __name__ == "__main__":
     main()
