@@ -1,6 +1,6 @@
 # NovelViews Assets — Blender Add-on
 
-> **Blender tools for Hunyuan3D-compatible camera rigs, animated tours, mesh normalization, and depth/normal rendering — all from a single sidebar panel.**
+> **Blender tools for camera rigs, animated tours, mesh normalization, and depth/normal rendering — all from a single sidebar panel.**
 
 <img src="assets/mutlicam_blender_viewport.png" width="600"/>
 
@@ -78,8 +78,8 @@ Renders depth or surface normal maps directly from any camera in the scene.
 | **Output Format** | PNG image sequence or H.264 MP4 |
 | **Preview Frame** | Renders just the current frame so you can verify before a full render |
 
-<img src="blender_render/depth/depth_0120.png" width="300"/>
-<img src="blender_render/normal/normal_0001.png" width="300"/>
+<img src="assets/depth_0120.png" width="300"/>
+<img src="assets/normal_0001.png" width="300"/>
 
 ---
 
