@@ -2,7 +2,7 @@
 
 > **Blender tools for camera rigs, animated tours, mesh normalization, and depth / normal / position map rendering — all from a single sidebar panel.**
 
-<video src="assets/demo.mp4" width="640" controls loop muted></video>
+<img src="assets/demo.gif" width="960"/>
 
 ---
 
@@ -24,16 +24,16 @@
 ```
 ./package_addon.sh          # generates novelviews_assets.zip
 ```
-Then in Blender: **Edit → Preferences → Add-ons → Install…** → select the zip → enable **"3D View: NovelViews Assets"**
+Then in Blender: **Edit → Preferences → Add-ons → Install…** → select the zip → enable **"3D View: Blender Render Passes"**
 
 **Option B — directly from the repo**
 
 Symlink or copy `blender_addon/` into your Blender add-ons folder:
 ```
-~/.config/blender/<version>/scripts/addons/novelviews_assets/
+~/.config/blender/<version>/scripts/addons/blender_render_passes/
 ```
 
-Open the **N-panel** in the 3D Viewport → **NovelViews** tab.
+Open the **N-panel** in the 3D Viewport → **Render Passes** tab.
 
 ---
 
