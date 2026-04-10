@@ -1,8 +1,8 @@
-# NovelViews Assets — Blender Add-on
+# Assets Render Passes — Blender Add-on
 
-> **Blender tools for camera rigs, animated tours, mesh normalization, and depth/normal rendering — all from a single sidebar panel.**
+> **Blender tools for camera rigs, animated tours, mesh normalization, and depth / normal / position map rendering — all from a single sidebar panel.**
 
-<img src="assets/mutlicam_blender_viewport.png" width="600"/>
+<video src="assets/demo.mp4" width="640" controls loop muted></video>
 
 ---
 
@@ -14,7 +14,7 @@
 | **Camera Spherical Tour** | Animated camera that visits every Hunyuan3D viewpoint in a smooth spherical trajectory |
 | **Camera 360 Tour** | Clean 360° horizontal orbit around the asset — configurable elevation, seamlessly looping |
 | **Normalize Mesh** | Centers and scales your mesh to match Hunyuan3D's preprocessing (bounding sphere = 1.15) |
-| **Render Passes** | Renders depth maps and surface normals as image sequences or MP4 video, with inversion and background masking |
+| **Render Passes** | Depth, surface normal, and position maps — image sequence or MP4, Hunyuan3D-compatible output |
 
 ---
 
@@ -37,7 +37,35 @@ Open the **N-panel** in the 3D Viewport → **NovelViews** tab.
 
 ---
 
-## Panels
+## Render Passes
+
+One click sets up the full compositor graph and renders depth, surface normals, or position maps with preprocessing that matches Hunyuan3D's expected input format.
+
+| Pass | Details |
+|---|---|
+| **Depth** | Per-frame masked min-max normalization · near = white, far = black · black background |
+| **Surface Normal** | Camera-space normals remapped −1..1 → 0..1 · white background |
+| **Position** | World-space XYZ → RGB via `pos / scale_factor + 0.5` · white background |
+| **Output** | PNG image sequence or H.264 MP4 |
+| **Preview Frame** | Renders only the current frame to verify before a full render |
+| **Color Management** | Automatically set to Display P3 / Raw for Hunyuan3D-compatible output |
+
+<table>
+<tr>
+  <td align="center"><b>Depth</b></td>
+  <td align="center"><b>Surface Normal</b></td>
+  <td align="center"><b>Position</b></td>
+</tr>
+<tr>
+  <td><img src="assets/depth.gif" width="260"/></td>
+  <td><img src="assets/normal.gif" width="260"/></td>
+  <td><img src="assets/position.gif" width="260"/></td>
+</tr>
+</table>
+
+---
+
+## Camera Tools
 
 ### Camera Setup
 Reproduces the exact viewpoints used by Hunyuan3D's multi-view renderer so renders in Blender match ComfyUI output 1:1.
@@ -60,26 +88,13 @@ Smooth 360° orbit around the world Z axis — the most natural "turntable" view
 - Pure yaw rotation, no roll
 - Keyframes get a **Cycles modifier** for seamless timeline looping
 
-### Normalize Mesh
+---
+
+## Normalize Mesh
 Matches Hunyuan3D's internal mesh preprocessing before inference.
 
 - Centers mesh at origin
 - Scales uniformly so the bounding sphere diameter equals the target value (default 1.15)
-
-### Render Passes
-
-Renders depth or surface normal maps directly from any camera in the scene.
-
-| Option | Details |
-|---|---|
-| **Pass** | Depth (grayscale) or Surface Normal (RGB) |
-| **Invert Depth** | Near = white, far = black |
-| **Mask Background** | Multiplies by alpha — background pixels become 0 |
-| **Output Format** | PNG image sequence or H.264 MP4 |
-| **Preview Frame** | Renders just the current frame so you can verify before a full render |
-
-<img src="assets/depth_0120.png" width="300"/>
-<img src="assets/normal_0001.png" width="300"/>
 
 ---
 

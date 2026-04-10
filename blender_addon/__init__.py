@@ -663,7 +663,7 @@ class NOVELVIEWS_OT_setup_render_passes(Operator):
             scene.render.ffmpeg.format              = 'MPEG4'
             scene.render.ffmpeg.codec               = 'H264'
             scene.render.ffmpeg.constant_rate_factor = 'HIGH'
-            scene.render.filepath = os.path.join(out_root, f"{pass_name}.mp4")
+            scene.render.filepath = os.path.join(out_root, pass_name)
             node = tree.nodes.new("CompositorNodeComposite")
             node.label = f"{pass_name.title()} Output"
             return node, 0   # "Image" input
@@ -704,9 +704,9 @@ class NOVELVIEWS_OT_setup_render_passes(Operator):
         #     • stretches the remaining foreground range to [0, 1]
         #     • result: near = white (1), far = black (0), background = black (0)
 
-        # Normalize raw Z to 0-1 using object bounds derived from camera & mesh settings.
-        # near/far computed from camera_distance ± mesh_radius so that only the
-        # foreground object spans the full [0,1] range — background gets clamped to 1.
+        # Step 1 — Map Value: bring HDR Z values into [0,1] using camera/mesh params.
+        #   Background (Z=far_clip≈100) gets clamped to 1.0.
+        #   This must come first so subsequent Math nodes don't receive raw Z > 1.
         mesh_radius = props.mesh_scale_factor / 2.0
         near = props.camera_distance - mesh_radius
         far  = props.camera_distance + mesh_radius
@@ -720,27 +720,60 @@ class NOVELVIEWS_OT_setup_render_passes(Operator):
         mv.max[0]    = 1.0
         mv.location  = (x, 0)
         tree.links.new(rl.outputs["Depth"], mv.inputs[0])
-        prev = mv.outputs[0]
         x += 220
 
-        # Invert: 1 - depth  (near=white, far=black)
-        if props.depth_invert:
-            inv = tree.nodes.new("CompositorNodeMath")
-            inv.operation = 'SUBTRACT'
-            inv.inputs[0].default_value = 1.0
-            inv.location = (x, 0)
-            tree.links.new(prev, inv.inputs[1])
-            prev = inv.outputs[0]
-            x += 220
+        # Step 2 — Mask background to 0 (background was clamped to 1.0 by Map Value).
+        mask1 = tree.nodes.new("CompositorNodeMath")
+        mask1.operation = 'MULTIPLY'
+        mask1.location  = (x, 0)
+        tree.links.new(mv.outputs[0],         mask1.inputs[0])
+        tree.links.new(rl.outputs["Alpha"],   mask1.inputs[1])
+        x += 220
 
-        # Mask background to 0
-        if props.depth_mask_bg:
-            mask = tree.nodes.new("CompositorNodeMath")
-            mask.operation = 'MULTIPLY'
-            mask.location = (x, 0)
-            tree.links.new(prev,                mask.inputs[0])
-            tree.links.new(rl.outputs["Alpha"], mask.inputs[1])
-            prev = mask.outputs[0]
+        # Step 3 — First Normalize: stretches [0, fg_far] → [0, 1].
+        norm1 = tree.nodes.new("CompositorNodeNormalize")
+        norm1.location = (x, 0)
+        tree.links.new(mask1.outputs[0], norm1.inputs[0])
+        x += 220
+
+        # Step 4 — Invert: near becomes bright, far→0, background (0)→1.
+        inv1 = tree.nodes.new("CompositorNodeMath")
+        inv1.operation = 'SUBTRACT'
+        inv1.inputs[0].default_value = 1.0
+        inv1.location = (x, 0)
+        tree.links.new(norm1.outputs[0], inv1.inputs[1])
+        x += 220
+
+        # Step 5 — Re-mask: background (now 1 after invert) back to 0.
+        mask2 = tree.nodes.new("CompositorNodeMath")
+        mask2.operation = 'MULTIPLY'
+        mask2.location  = (x, 0)
+        tree.links.new(inv1.outputs[0],       mask2.inputs[0])
+        tree.links.new(rl.outputs["Alpha"],   mask2.inputs[1])
+        x += 220
+
+        # Step 6 — Second Normalize: foreground now spans full [0, 1].
+        #   near = white (1), far = black (0), background = black (0).
+        norm2 = tree.nodes.new("CompositorNodeNormalize")
+        norm2.location = (x, 0)
+        tree.links.new(mask2.outputs[0], norm2.inputs[0])
+        prev = norm2.outputs[0]
+        x += 220
+
+        # Optional extra invert: flips to near=black, far=white
+        if props.depth_invert:
+            inv2 = tree.nodes.new("CompositorNodeMath")
+            inv2.operation = 'SUBTRACT'
+            inv2.inputs[0].default_value = 1.0
+            inv2.location = (x, 0)
+            tree.links.new(prev, inv2.inputs[1])
+            x += 220
+            mask3 = tree.nodes.new("CompositorNodeMath")
+            mask3.operation = 'MULTIPLY'
+            mask3.location  = (x, 0)
+            tree.links.new(inv2.outputs[0],       mask3.inputs[0])
+            tree.links.new(rl.outputs["Alpha"],   mask3.inputs[1])
+            prev = mask3.outputs[0]
             x += 220
 
         # Output
@@ -749,7 +782,8 @@ class NOVELVIEWS_OT_setup_render_passes(Operator):
         if props.render_output_format == 'IMAGE_SEQ':
             out.format.file_format = 'PNG'
             out.format.color_mode  = 'BW'
-            out.format.color_depth = '16'
+            out.format.color_depth  = '16'
+            out.format.compression  = 0
         tree.links.new(prev, out.inputs[slot])
 
     def _setup_normal(self, scene, tree, rl, out_root, props):
@@ -851,7 +885,7 @@ class NOVELVIEWS_OT_render_preview(Operator):
             orig_format = scene.render.image_settings.file_format
             orig_path   = scene.render.filepath
             scene.render.image_settings.file_format = 'PNG'
-            pass_name   = "depth" if props.render_pass_type == 'DEPTH' else "normal"
+            pass_name   = {'DEPTH': 'depth', 'NORMAL': 'normal', 'POSITION': 'position'}[props.render_pass_type]
             out_root    = bpy.path.abspath(props.render_output_dir)
             scene.render.filepath = os.path.join(out_root, f"{pass_name}_preview.png")
             bpy.ops.render.render(animation=False, write_still=True)
@@ -870,6 +904,16 @@ class NOVELVIEWS_OT_render_animation(Operator):
     bl_options = {"REGISTER"}
 
     def execute(self, context):
+        props = context.scene.novelviews_props
+        scene = context.scene
+        if props.render_output_format == 'MP4':
+            pass_name = {'DEPTH': 'depth', 'NORMAL': 'normal', 'POSITION': 'position'}[props.render_pass_type]
+            out_root  = bpy.path.abspath(props.render_output_dir)
+            scene.render.image_settings.file_format      = 'FFMPEG'
+            scene.render.ffmpeg.format                   = 'MPEG4'
+            scene.render.ffmpeg.codec                    = 'H264'
+            scene.render.ffmpeg.constant_rate_factor     = 'HIGH'
+            scene.render.filepath = os.path.join(out_root, pass_name)
         bpy.ops.render.render(animation=True)
         return {"FINISHED"}
 
